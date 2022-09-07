@@ -176,7 +176,7 @@ func (t *TemplateResource) setVars() error {
 	var err error
 	log.Debug("Retrieving keys from store")
 	log.Debug("Key prefix set to " + t.Prefix)
-
+	fmt.Printf("t.Prefix=%s,t.Keys=%s, all=%s\n", t.Prefix, t.Keys, util.AppendPrefix(t.Prefix, t.Keys))
 	result, err := t.storeClient.GetValues(util.AppendPrefix(t.Prefix, t.Keys))
 	if err != nil {
 		return err
@@ -346,7 +346,9 @@ func runCommand(cmd string) error {
 // from the store, then we stage a candidate configuration file, and finally sync
 // things up.
 // It returns an error if any.
+//强制触发模板文件的更新/检查逻辑
 func (t *TemplateResource) process() error {
+
 	if err := t.setFileMode(); err != nil {
 		return err
 	}

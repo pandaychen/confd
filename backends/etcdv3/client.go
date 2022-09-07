@@ -3,15 +3,17 @@ package etcdv3
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io/ioutil"
 	"strings"
 	"time"
 
 	"golang.org/x/net/context"
 
+	"sync"
+
 	"github.com/coreos/etcd/clientv3"
 	"github.com/kelseyhightower/confd/log"
-	"sync"
 )
 
 // A watch only tells the latest revision
@@ -25,30 +27,36 @@ type Watch struct {
 }
 
 // Wait until revision is greater than lastRevision
-func (w *Watch) WaitNext(ctx context.Context, lastRevision int64, notify chan<-int64) {
+func (w *Watch) WaitNext(ctx context.Context, lastRevision int64, notify chan<- int64) {
 	for {
 		w.rwl.RLock()
+		fmt.Printf("[etcdv3]WaitNext watch loop start,w.revision=%d,lastRevision=%d\n", w.revision, lastRevision)
 		if w.revision > lastRevision {
+			// w.revision 通过每次的update，保存着最新的revision值，lastRevision为上一次的
+			fmt.Println("[etcdv3]WaitNext watch break loop,return new revision,w.revision=%d,lastRevision=%d\n", w.revision, lastRevision)
 			w.rwl.RUnlock()
 			break
 		}
 		cond := w.cond
 		w.rwl.RUnlock()
-		select{
+		select {
 		case <-cond:
+			fmt.Printf("[etcdv3] loop go-on,w.revision=%d,lastRevision=%d\n", w.revision, lastRevision)
 		case <-ctx.Done():
 			return
 		}
 	}
 	// We accept larger revision, so do not need to use RLock
-	select{
-	case notify<-w.revision:
+	select {
+	case notify <- w.revision:
 	case <-ctx.Done():
 	}
 }
 
 // Update revision
-func (w *Watch) update(newRevision int64){
+// 初始化时，会触发update
+// 当etcd相关的key有变动，即本地w.revision与远端的vision值相比有变化的场景下，会触发update
+func (w *Watch) update(newRevision int64) {
 	w.rwl.Lock()
 	defer w.rwl.Unlock()
 	w.revision = newRevision
@@ -58,12 +66,14 @@ func (w *Watch) update(newRevision int64){
 
 func createWatch(client *clientv3.Client, prefix string) (*Watch, error) {
 	w := &Watch{0, make(chan struct{}), sync.RWMutex{}}
+	fmt.Printf("[etcdv3]start goroutine for createWatch,prefix=%s\n", prefix)
 	go func() {
 		rch := client.Watch(context.Background(), prefix, clientv3.WithPrefix(),
-							clientv3.WithCreatedNotify())
+			clientv3.WithCreatedNotify())
 		log.Debug("Watch created on %s", prefix)
 		for {
 			for wresp := range rch {
+				fmt.Printf("[etcdv3]createWatch get events from rch channel,wresp.CompactRevision=%d, wresp.Header.GetRevision()=%d,w.revision=%d\n", wresp.CompactRevision, wresp.Header.GetRevision(), w.revision)
 				if wresp.CompactRevision > w.revision {
 					// respect CompactRevision
 					w.update(wresp.CompactRevision)
@@ -84,21 +94,24 @@ func createWatch(client *clientv3.Client, prefix string) (*Watch, error) {
 			time.Sleep(time.Duration(1) * time.Second)
 			// Start from next revision so we are not missing anything
 			if w.revision > 0 {
+				fmt.Printf("[etcdv3]createWatch case 1 w.revision=%d\n", w.revision)
 				rch = client.Watch(context.Background(), prefix, clientv3.WithPrefix(),
-					clientv3.WithRev(w.revision + 1))
+					clientv3.WithRev(w.revision+1))
 			} else {
+				fmt.Printf("[etcdv3]createWatch case 2 w.revision=%d\n", w.revision)
 				// Start from the latest revision
 				rch = client.Watch(context.Background(), prefix, clientv3.WithPrefix(),
-									clientv3.WithCreatedNotify())
+					clientv3.WithCreatedNotify())
 			}
 		}
 	}()
+
 	return w, nil
 }
 
 // Client is a wrapper around the etcd client
 type Client struct {
-	client *clientv3.Client
+	client  *clientv3.Client
 	watches map[string]*Watch
 	// Protect watch
 	wm sync.Mutex
@@ -150,12 +163,12 @@ func NewEtcdClient(machines []string, cert, key, caCert string, basicAuth bool, 
 	if tlsEnabled {
 		cfg.TLS = tlsConfig
 	}
-	
+
 	client, err := clientv3.New(cfg)
 	if err != nil {
 		return &Client{}, err
 	}
-	
+
 	return &Client{client, make(map[string]*Watch), sync.Mutex{}}, nil
 }
 
@@ -168,19 +181,19 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 	// maybe an option should be added (also set max-txn=0 can disable Txn?)
 	maxTxnOps := 128
 	getOps := make([]string, 0, maxTxnOps)
-	doTxn := func (ops []string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3) * time.Second)
+	doTxn := func(ops []string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(3)*time.Second)
 		defer cancel()
-		
+
 		txnOps := make([]clientv3.Op, 0, maxTxnOps)
-		
+
 		for _, k := range ops {
 			txnOps = append(txnOps, clientv3.OpGet(k,
-											   clientv3.WithPrefix(),
-											   clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
-											   clientv3.WithRev(first_rev)))
+				clientv3.WithPrefix(),
+				clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
+				clientv3.WithRev(first_rev)))
 		}
-		
+
 		result, err := c.client.Txn(ctx).Then(txnOps...).Commit()
 		if err != nil {
 			return err
@@ -224,7 +237,7 @@ func (c *Client) GetValues(keys []string) (map[string]string, error) {
 
 func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error) {
 	var err error
-	
+
 	// Create watch for each key
 	watches := make(map[string]*Watch)
 	c.wm.Lock()
@@ -254,14 +267,15 @@ func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, sto
 			return
 		}
 	}()
-	
+
 	notify := make(chan int64)
 	// Wait for all watches
 	for _, v := range watches {
 		go v.WaitNext(ctx, int64(waitIndex), notify)
 	}
-	select{
-	case nextRevision := <- notify:
+	select {
+	case nextRevision := <-notify:
+		//返回给上层本次最新的revision
 		return uint64(nextRevision), err
 	case <-ctx.Done():
 		return 0, ctx.Err()

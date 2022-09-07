@@ -90,10 +90,15 @@ func (p *watchProcessor) Process() {
 	p.wg.Wait()
 }
 
+//针对单个模板中的多个key进行监听，特别注意：
+//当confd初始启动时，必须保证强制运行一次`t.process()`逻辑
 func (p *watchProcessor) monitorPrefix(t *TemplateResource) {
 	defer p.wg.Done()
+
+	//返回[]strings（待watcher的keys数组）
 	keys := util.AppendPrefix(t.Prefix, t.Keys)
 	for {
+		fmt.Printf("monitorPrefix [keys=%s] start=%v\n", keys, time.Now())
 		index, err := t.storeClient.WatchPrefix(t.Prefix, keys, t.lastIndex, p.stopChan)
 		if err != nil {
 			p.errChan <- err
@@ -101,7 +106,10 @@ func (p *watchProcessor) monitorPrefix(t *TemplateResource) {
 			time.Sleep(time.Second * 2)
 			continue
 		}
+		fmt.Println("[monitorPrefix]WatchPrefix triggered,update index=%d,err=%s\n", index, err)
 		t.lastIndex = index
+
+		//触发backend更新逻辑
 		if err := t.process(); err != nil {
 			p.errChan <- err
 		}

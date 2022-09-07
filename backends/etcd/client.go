@@ -3,6 +3,7 @@ package etcd
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -10,8 +11,8 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/client"
+	"github.com/kelseyhightower/confd/log"
 	"golang.org/x/net/context"
-        "github.com/kelseyhightower/confd/log"
 )
 
 // Client is a wrapper around the etcd client
@@ -33,10 +34,10 @@ func NewEtcdClient(machines []string, cert, key, caCert string, clientInsecure b
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
-        // Enable client insecure mode globally
-        if clientInsecure {
-                log.Warning("TLS Client config running insecure mode. Skip server CA verification.")
-        }
+	// Enable client insecure mode globally
+	if clientInsecure {
+		log.Warning("TLS Client config running insecure mode. Skip server CA verification.")
+	}
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: clientInsecure,
@@ -88,6 +89,7 @@ func NewEtcdClient(machines []string, cert, key, caCert string, clientInsecure b
 
 // GetValues queries etcd for keys prefixed by prefix.
 func (c *Client) GetValues(keys []string) (map[string]string, error) {
+	fmt.Println("[GetValues] key=%v start\n", keys)
 	vars := make(map[string]string)
 	for _, key := range keys {
 		resp, err := c.client.Get(context.Background(), key, &client.GetOptions{
@@ -124,12 +126,14 @@ func nodeWalk(node *client.Node, vars map[string]string) error {
 func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error) {
 	// return something > 0 to trigger a key retrieval from the store
 	if waitIndex == 0 {
+		// confd初始化时，waitIndex的值为0，这里强制返回，是为了触发首次拉取backend的操作
 		return 1, nil
 	}
 
 	// Setting AfterIndex to 0 (default) means that the Watcher
 	// should start watching for events starting at the current
 	// index, whatever that may be.
+	fmt.Println("WatchPrefix Watcher,prefix=%s,key=%v,waitIndex=%d\n", prefix, keys, waitIndex)
 	watcher := c.client.Watcher(prefix, &client.WatcherOptions{AfterIndex: uint64(0), Recursive: true})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelRoutine := make(chan bool)
@@ -145,7 +149,9 @@ func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, sto
 	}()
 
 	for {
+		//etcdV2的watcher会阻塞在此
 		resp, err := watcher.Next(ctx)
+		fmt.Println("WatchPrefix Watcher triggered,prefix=%s,key=%v,waitIndex=%d\n", prefix, keys, waitIndex)
 		if err != nil {
 			switch e := err.(type) {
 			case *client.Error:
@@ -162,6 +168,7 @@ func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, sto
 		// is reducing the scope of keys that can trigger updates.
 		for _, k := range keys {
 			if strings.HasPrefix(resp.Node.Key, k) {
+				fmt.Println("WatchPrefix Watcher events,respKey=%s,key=%v,waitIndex=%d,modifyIndex=%d\n", resp.Node.Key, k, waitIndex, resp.Node.ModifiedIndex)
 				return resp.Node.ModifiedIndex, err
 			}
 		}
